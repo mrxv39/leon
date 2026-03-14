@@ -4,16 +4,21 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use image::{
     imageops::FilterType, DynamicImage, GenericImageView, GrayImage, ImageBuffer, ImageFormat,
-    Luma,
+    Luma, Rgba,
 };
 
+use crate::mrtd_parser;
+
 const MRZ_ALLOWED_CHARS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<";
+const MRZ_LEFT_MARGIN_PX: u32 = 12;
+const MRZ_PARALLEL_ATTEMPTS: usize = 3;
 
 pub fn run_ocr_from_base64(image_base64: &str) -> Result<String, String> {
     let (bytes, format) = decode_image_payload(image_base64)?;
@@ -106,16 +111,42 @@ fn run_mrz_ocr_on_image(image: &DynamicImage) -> Result<String, String> {
     let mut best_result: Option<(i32, String)> = None;
     let mut last_error: Option<String> = None;
 
-    for attempt in attempts {
-        let output = run_mrz_attempt(&attempt);
+    let parallel_count = attempts.len().min(MRZ_PARALLEL_ATTEMPTS);
+    if parallel_count > 0 {
+        let mut handles = Vec::with_capacity(parallel_count);
+        for attempt in attempts.iter().take(parallel_count).cloned() {
+            handles.push(thread::spawn(move || run_mrz_attempt(&attempt)));
+        }
 
-        match output {
-            Ok(raw) => {
-                let score = score_mrz_text(&raw);
-                match &best_result {
-                    Some((best_score, _)) if *best_score >= score => {}
-                    _ => best_result = Some((score, raw)),
+        let mut parallel_outputs = Vec::with_capacity(parallel_count);
+        for handle in handles {
+            match handle.join() {
+                Ok(output) => parallel_outputs.push(output),
+                Err(_) => parallel_outputs.push(Err("MRZ attempt thread panicked".to_string())),
+            }
+        }
+
+        for output in parallel_outputs {
+            match output {
+                Ok(raw) => {
+                    if mrtd_parser::parse_mrz_text(&raw).is_some() {
+                        return Ok(raw);
+                    }
+                    update_best_mrz_result(&mut best_result, raw);
                 }
+                Err(error) => last_error = Some(error),
+            }
+        }
+    }
+
+    for attempt in attempts.into_iter().skip(parallel_count) {
+        match run_mrz_attempt(&attempt) {
+            Ok(raw) => {
+                if mrtd_parser::parse_mrz_text(&raw).is_some() {
+                    return Ok(raw);
+                }
+
+                update_best_mrz_result(&mut best_result, raw);
             }
             Err(error) => last_error = Some(error),
         }
@@ -127,6 +158,14 @@ fn run_mrz_ocr_on_image(image: &DynamicImage) -> Result<String, String> {
         Err(error)
     } else {
         Err("no MRZ OCR attempts were produced".to_string())
+    }
+}
+
+fn update_best_mrz_result(best_result: &mut Option<(i32, String)>, raw: String) {
+    let score = score_mrz_text(&raw);
+    match best_result {
+        Some((best_score, _)) if *best_score >= score => {}
+        _ => *best_result = Some((score, raw)),
     }
 }
 
@@ -253,38 +292,42 @@ fn prepare_mrz_attempts(image: &DynamicImage) -> Vec<MrzAttempt> {
     let mut attempts = Vec::new();
     let oriented_images = [image.clone(), image.rotate90(), image.rotate270()];
 
-    for oriented in oriented_images {
-        let band_variants = [
-            crop_mrz_focus_band(&oriented, 58, 82),
-            crop_mrz_focus_band(&oriented, 62, 86),
-            crop_mrz_focus_band(&oriented, 64, 88),
-            crop_mrz_band(&oriented, 28, 0),
-        ];
+    for oriented in &oriented_images {
+        for &(top_percent, bottom_percent) in &[(62, 86), (64, 88)] {
+            let band = crop_mrz_focus_band(oriented, top_percent, bottom_percent);
+            attempts.push(MrzAttempt {
+                images: vec![preprocess_mrz_band(&band, 260, 160, 0)],
+                psm: 6,
+            });
+        }
+    }
 
-        for band in band_variants {
-            for threshold in [145u8, 160u8, 175u8] {
-                attempts.push(MrzAttempt {
-                    images: vec![preprocess_mrz_band(&band, 260, threshold, 0)],
-                    psm: 6,
-                });
-            }
+    for oriented in &oriented_images {
+        for &(top_percent, bottom_percent) in &[(62, 86), (64, 88)] {
+            let band = crop_mrz_focus_band(oriented, top_percent, bottom_percent);
+            attempts.push(MrzAttempt {
+                images: vec![preprocess_mrz_band(&band, 300, 170, 4)],
+                psm: 6,
+            });
+        }
 
-            for split in split_mrz_lines(&band) {
-                attempts.push(MrzAttempt {
-                    images: vec![
-                        preprocess_mrz_band(&split[0], 160, 150, 0),
-                        preprocess_mrz_band(&split[1], 160, 150, 0),
-                    ],
-                    psm: 7,
-                });
-                attempts.push(MrzAttempt {
-                    images: vec![
-                        preprocess_mrz_band(&split[0], 200, 170, 8),
-                        preprocess_mrz_band(&split[1], 200, 170, 8),
-                    ],
-                    psm: 7,
-                });
-            }
+        let fallback_band = crop_mrz_band(oriented, 28, 0);
+        attempts.push(MrzAttempt {
+            images: vec![preprocess_mrz_band(&fallback_band, 260, 160, 0)],
+            psm: 6,
+        });
+    }
+
+    for oriented in &oriented_images {
+        let band = crop_mrz_focus_band(oriented, 62, 86);
+        if let Some(split) = split_mrz_lines(&band).into_iter().next() {
+            attempts.push(MrzAttempt {
+                images: vec![
+                    preprocess_mrz_band(&split[0], 180, 160, 0),
+                    preprocess_mrz_band(&split[1], 180, 160, 0),
+                ],
+                psm: 7,
+            });
         }
     }
 
@@ -302,14 +345,40 @@ fn crop_mrz_band(image: &DynamicImage, height_percent: u32, upward_shift_percent
         .saturating_sub(upward_shift)
         .min(height.saturating_sub(1));
     let crop_height = band_height.min(height.saturating_sub(top));
-    image.crop_imm(0, top, width, crop_height.max(1))
+    add_left_margin(&image.crop_imm(0, top, width, crop_height.max(1)), MRZ_LEFT_MARGIN_PX)
 }
 
 fn crop_mrz_focus_band(image: &DynamicImage, top_percent: u32, bottom_percent: u32) -> DynamicImage {
     let (width, height) = image.dimensions();
     let top = (height.saturating_mul(top_percent) / 100).min(height.saturating_sub(1));
     let bottom = (height.saturating_mul(bottom_percent) / 100).clamp(top + 1, height);
-    image.crop_imm(0, top, width, bottom.saturating_sub(top).max(1))
+    add_left_margin(
+        &image.crop_imm(0, top, width, bottom.saturating_sub(top).max(1)),
+        MRZ_LEFT_MARGIN_PX,
+    )
+}
+
+fn add_left_margin(image: &DynamicImage, margin_left: u32) -> DynamicImage {
+    if margin_left == 0 {
+        return image.clone();
+    }
+
+    let rgba = image.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mut widened = ImageBuffer::from_pixel(
+        width.saturating_add(margin_left),
+        height,
+        Rgba([255, 255, 255, 255]),
+    );
+
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = rgba.get_pixel(x, y);
+            widened.put_pixel(x + margin_left, y, *pixel);
+        }
+    }
+
+    DynamicImage::ImageRgba8(widened)
 }
 
 fn preprocess_mrz_band(
@@ -505,6 +574,7 @@ fn normalize_label(label: &str) -> String {
         .join(" ")
 }
 
+#[derive(Clone)]
 struct MrzAttempt {
     images: Vec<DynamicImage>,
     psm: u8,
